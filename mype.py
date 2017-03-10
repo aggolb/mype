@@ -1,3 +1,16 @@
+'''
+## mype local
+## 
+## WHAT:
+## (my)Sky(pe) my shot at video chat over LAN
+##
+## HOW:
+## Open mype.py and enter the IP Address of the person you're calling.
+## Click "Connect" and wait
+##
+## Author: Shimpano Mutangama
+'''
+
 from pyaudio import PyAudio,paInt16
 import Tkinter as tk
 from PIL import Image, ImageTk
