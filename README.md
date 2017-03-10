@@ -1,5 +1,5 @@
-# mype
-(my)sky(pe) A peer to peer video chat app...  
+# mype local
+(my)sky(pe) A local (LAN) peer to peer video chat app...  
 My implementation of a simple video chat application..
 
 #Preparations
