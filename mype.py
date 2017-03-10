@@ -1,5 +1,5 @@
 '''
-## mype local
+## mype local 1.0
 ## 
 ## WHAT:
 ## (my)Sky(pe) my shot at video chat over LAN
