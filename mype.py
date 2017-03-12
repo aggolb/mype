@@ -1,12 +1,20 @@
-'''
-## mype local 1.0
+''' 
+## MYPE LOCAL 1.0
 ## 
 ## WHAT:
-## (my)Sky(pe) my shot at video chat over LAN
+## (my)Sky(pe) A shot at (semi-reliable) UDP video chat over LAN
 ##
 ## HOW:
 ## Open mype.py and enter the IP Address of the person you're calling.
-## Click "Connect" and wait
+## Click "Connect" and wait for them to accept your call.
+##
+## NOTES:
+## While it works, this wasn't meant to be a fully fledged chat app. It was made strictly for educational purposes
+## It uses Tkinter for the GUI which while easy to use isn't very "thread safe" and lacks a good amount
+##   of features that are available from other industry players. As such there are a few GUI related hacks sprinkled in
+##   to get the desired results.
+## OpenCV is used strictly for the purpose of camera access, so can esily be swapped put with a smaller library
+##   without too much trouble
 ##
 ## Author: Shimpano Mutangama
 '''
@@ -33,7 +41,8 @@ class VideoWindow:
         #The window for the frame received from the network
         self.received_frame_box = None
         self.received_video_frame = None
-        
+
+        self.dialog = tkMessageBox
         #Link the clients
         self.video_client = None
         self.audio_client = None
@@ -45,9 +54,16 @@ class VideoWindow:
         #Link the camera
         self.camera = None
 
+        #Link the coordinator
+        self.coordinator = None
+
         #These will be used to connect and disconnect
         self.input_box = None
         self.button_text = None
+        self.connect_button = None
+
+        #Check if user in call
+        self.in_call = False
         
         self._prepare_main_window()
 
@@ -78,9 +94,9 @@ class VideoWindow:
         #Connect Button
         self.button_text = tk.StringVar()
         self.button_text.set("Connect")
-        connect_button = tk.Button(options_frame, textvariable = self.button_text)
-        connect_button.pack(side = tk.LEFT)
-        connect_button.bind('<Button-1>',self.connect)
+        self.connect_button = tk.Button(options_frame, text = "Connect")
+        self.connect_button.pack(side = tk.LEFT)
+        self.connect_button.bind('<Button-1>',self.start_connection)
 
         #Contains the received video frame
         self.received_frame_box = tk.Frame(self.main_window, width = 320, height = 240, bg = "#000000")
@@ -98,31 +114,90 @@ class VideoWindow:
         self.captured_video_frame = tk.Label(self.captured_frame_box,bg="#000000")
         self.captured_video_frame.pack(fill=tk.X)
 
-    def connect(self,event):
-        
-        text = self.button_text.get()
-        if text == "Connect":
+        #Call Options
+        self.call_options_frame = tk.Frame(self.main_window,height = 200)
+        self.call_options_frame.pack_forget()
 
+        #Answer Button
+        self.answer_button = tk.Button(self.call_options_frame, text = "Answer", command = self.answer_call)
+        self.answer_button.pack(side = tk.LEFT)
+        self.reject_button = tk.Button(self.call_options_frame, text = "Reject", command = self.reject_call)
+        self.reject_button.pack(side = tk.LEFT)
+
+    def answer_call(self):
+        
+        client_address = self.coordinator.temp_client
+        ip_address = client_address[0]
+
+        #Tell the caller you accept
+        self.coordinator.c_server_socket.sendto("accepted",client_address)
+
+        #Set the address of the callers coordinator
+        self.coordinator.connected_address = (ip_address,1002)
+        self.coordinator.available = False
+        self.connect_button.configure(text="Disconnect")
+        self.in_call = True
+        
+        #Connect to the caller
+        self.video_client.start_client(client_address[0])
+        self.audio_client.start_client(client_address[0])
+        self.coordinator.temp_client = None
+
+        #Hide the call options
+        self.call_options_frame.pack_forget()
+
+    def reject_call(self):
+        client_address = self.coordinator.temp_client
+        #Tell the caller you decline
+        self.coordinator.c_server_socket.sendto("rejected",client_address)
+        #Hide the call options
+        self.call_options_frame.pack_forget()
+
+    def connect(self):
+        
+        if self.in_call == False:
+            
+            self.connect_button.configure(text="Calling")
+            
             #Get Ip Address from input box
             ip_address = self.input_box.get()
+            result = self.coordinator.make_call(ip_address)
             
-            #Disable calls
-            self.video_server.accept_calls = False
-            self.video_client.start_client(ip_address)
-            self.audio_server.accept_calls = False
-            self.audio_client.start_client(ip_address)
+            if result == True:
+                
+                #Disable calls
+                self.connect_button.configure(text="Disconnect")
+                self.in_call = True
+                self.coordinator.available = False
+                self.video_client.start_client(ip_address)
+                self.audio_client.start_client(ip_address)
+                
+            else:
+                
+                self.connect_button.configure(text="Connect")
+                self.in_call = False
+                print "Call Failed"
             
         else:
-            self.button_text.set("Connect")
-
+            self.connect_button.configure(text="Connect")
+            self.in_call = False
             #Enable Calls
-            self.video_server.accept_calls = True
+            self.coordinator.end_call()
             self.video_server.running = False
             self.video_client.running = False
-            self.audio_server.accept_calls = True
             self.audio_server.running = False
             self.audio_client.running = False
-            
+
+           
+    
+    def start_connection(self,event):
+        #The GUI runs in a single thread loop, doing something like making a call would
+        #would block and all UI elements including the camera output would freeze
+        #using a daemon thread helps avoid this effect
+        t = threading.Thread(target = self.connect)
+        t.daemon = True
+        t.start()
+         
    
 
     def show_received_frame(self,frame):
@@ -167,9 +242,102 @@ class VideoWindow:
         self.main_window.destroy()
         self.main_window.quit()
         
+#The Coordinator Class Coordinates Calls, it listens for calls, makes calls and ends calls.
+#It doesn't handle the actual transmission over voice or video
+class Coordinator:
+
+    def __init__(self):
         
+        self.video_server = None
+        self.video_client = None
+        self.audio_server = None
+        self.audio_client = None
+        self.c_server_socket = None
+        self.c_client_socket = None
+        self.available = True
+        self.window = None
+        
+        #The address of the client with an accepted call
+        self.connected_address = None
+        #Temporarily stores the client whose making a request
+        self.temp_client = None
 
 
+    def make_call(self,ip_address):
+        
+        HOST = ip_address
+        PORT = 1002
+        calling_address = (HOST,PORT)
+        
+        try:
+            self.c_client_socket.sendto("call",calling_address)
+            data, addr = self.c_client_socket.recvfrom(1024)
+            
+            print data
+            
+            if data == "accepted":
+                self.available = False
+                self.connected_address = calling_address
+                return True
+            elif data == "rejected":
+                return False
+            
+        except:
+            return False
+
+    def end_call(self):
+
+        self.c_client_socket.sendto("endcall",self.connected_address)
+        self.available = True
+        #The host,port pair for the user currently in a call with
+        self.connected_address = None
+    
+    def start_server(self):
+        t = threading.Thread(target = self.run)
+        t.daemon = True
+        t.start()
+
+    def run(self):
+        HOST = '0.0.0.0'
+        PORT = 1002
+
+        self.c_server_socket = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        self.c_server_socket.bind((HOST,PORT))
+        self.c_client_socket = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        #Determine how long you can try to connect, basically maximum ring time before giving up
+        #ring time 20 seconds
+        self.c_client_socket.settimeout(20)
+
+        while True:
+            #Wait for requests
+            data,client_address = self.c_server_socket.recvfrom(1024)
+            ip_address = client_address[0]
+            
+            #Handle request
+            if data == "call":
+                
+                print "Availability: ",self.available
+                
+                if self.available == True:
+                    self.temp_client = client_address
+                    self.window.call_options_frame.pack()
+                    #The GUI will now handle accepting or rejecting the call
+                else:
+                    self.c_server_socket.sendto("rejected",client_address)
+                  
+
+            elif data == "endcall":
+                print "Ending call.."
+                self.window.connect_button.configure(text="Connect")
+                self.window.in_call = False
+                self.available = True
+                self.connected_address = None
+                self.video_client.running = False
+                self.video_server.running = False
+                self.audio_client.running = False
+                self.audio_server.running = False
+                                           
+                
 class Camera:
     
     def __init__(self):
@@ -228,15 +396,10 @@ class VideoServer:
         while self.listening:
             
             #Wait for someone to connect to you
-            print "\nWaiting for a connection to video feed..."
             data,self.client_address = self.video_socket.recvfrom(1024)
+            if data != "start":
+                continue
             print "\nConnection to video feed from: ",self.client_address
-
-            #If a user I'm not yet connected to asks for my video feed,start a
-            #client to ask for theirs
-            if self.accept_calls == True:
-                self.video_client.start_client(self.client_address[0])
-
             self.running = True
             self.broadcast_video()
         print "\nvideo server shut down"
@@ -258,14 +421,14 @@ class VideoServer:
                 #print "Memory jpeg is %s bytes"%len(image_bytes.getvalue())
                 try:
                     
-                    self.video_socket.settimeout(3)
-                    data = image_bytes.read(4096)
+                    self.video_socket.settimeout(1)
+                    data = image_bytes.read(60000)
                     #print "Starting to read"
                     while data:
                         
                         self.video_socket.sendto(data,self.client_address)
                         ack = self.video_socket.recvfrom(1024)
-                        data = image_bytes.read(4096)
+                        data = image_bytes.read(60000)
                         
                     self.video_socket.sendto("end",self.client_address)
                     ack = self.video_socket.recvfrom(1024)
@@ -309,49 +472,47 @@ class AudioServer:
         while self.listening:
 
             #Wait for someone to connect
-            print "\nWaiting for a connection to audio feed..."
             data,self.client_address = self.audio_socket.recvfrom(1024)
+            if data != "start":
+                continue
             print "\nConnection to audio feed from: ",self.client_address
-            #If not yet connected, conncect
-            if self.accept_calls:
-                self.audio_client.start_client(self.client_address[0])
-
             self.running = True
             self.broadcast_audio()
         print "\naudio server shut down"
 
     def broadcast_audio(self):
+        
+        CHUNK = 1024
+        FORMAT = paInt16
+        CHANNELS = 2
+        RATE = 44100
+
+        p = PyAudio()
+        self.audio_recorder = p.open(format = FORMAT,
+                                     channels = CHANNELS,
+                                     rate = RATE,
+                                     input = True,
+                                     frames_per_buffer = CHUNK)
+
         while self.running:
-            CHUNK = 1024
-            FORMAT = paInt16
-            CHANNELS = 2
-            RATE = 44100
+            try:
+                data = self.audio_recorder.read(1024)
+            except:
+                continue
 
-            p = PyAudio()
-            self.audio_recorder = p.open(format = FORMAT,
-                                         channels = CHANNELS,
-                                         rate = RATE,
-                                         input = True,
-                                         frames_per_buffer = CHUNK)
+            #Given our pyaudio params, each read will be 4096 bytes
+            data = bytes(data)
+            self.audio_socket.sendto(data,self.client_address)
+            try:
+                self.audio_socket.settimeout(3)
+                ack = self.audio_socket.recvform(1024)
+                self.audio_socket.settimeout(None)
+            except:
+                self.audio_socket.settimeout(None)
+                pass
 
-            while self.running:
-                try:
-                    data = self.audio_recorder.read(1024)
-                except:
-                    continue
-
-                #Given our pyaudio params, each read will be 4096 bytes
-                data = bytes(data)
-                self.audio_socket.sendto(data,self.client_address)
-                try:
-                    self.audio_socket.settimeout(3)
-                    ack = self.audio_socket.recvform(1024)
-                    self.audio_socket.settimeout(None)
-                except:
-                    self.audio_socket.settimeout(None)
-                    pass
-
-            self.audio_recorder.close()
+        self.audio_recorder.close()
+        print "Done with call"
         
 
 class VideoClient:
@@ -375,7 +536,6 @@ class VideoClient:
 
     def run(self,ip_address):
         self.running = True
-        self.update_window_button()
         HOST = ip_address
         PORT = 1000 #standard for video
 
@@ -391,9 +551,9 @@ class VideoClient:
         
         while self.running:
             try:
-                self.video_socket.settimeout(3)
+                self.video_socket.settimeout(1)
                 image_bytes = BytesIO()
-                data,addr = self.video_socket.recvfrom(4096)
+                data,addr = self.video_socket.recvfrom(60000)
                 
                 while True:
                     if data[-3:] == "end":
@@ -402,10 +562,13 @@ class VideoClient:
                         break
                     image_bytes.write(data)
                     self.video_socket.sendto("ack",self.server_address)
-                    data,addr = self.video_socket.recvfrom(4096)
+                    data,addr = self.video_socket.recvfrom(60000)
 
                 
                 image_bytes.seek(0)
+                #t = threading.Thread(target = self.window.show_received_frame,args=(image_bytes,))
+                #t.daemon = True
+                #t.start()
                 self.window.show_received_frame(image_bytes)
                 self.video_socket.settimeout(None)
             except:
@@ -413,13 +576,6 @@ class VideoClient:
                 self.video_socket.settimeout(None)
                 pass
         print "\nvideo client shut down"
-
-    def update_window_button(self):
-        #We want the GUI to know when the client has been trigged, i.e.
-        #is in the process of reciving a feed, so we know to show "Connect or Disconnect Button
-        self.window.button_text.set("Disconnect")
-                
-    
 
 class AudioClient:
 
@@ -464,12 +620,14 @@ class AudioClient:
                 data, server = self.audio_socket.recvfrom(4096)
                 #play audio
                 self.audio_player.write(data)
+                self.audio_socket.sendto("ack",self.server_address)
                 self.audio_socket.settimeout(None)
             except:
                 self.audio_socket.settimeout(None)
                 pass
+            
 
-            self.audio_socket.sendto("ack",self.server_address)
+            
             
         print "\naudio client shut down"
 
@@ -482,12 +640,15 @@ class App:
         
         self.webcam = Camera()
         self.window = VideoWindow()
+
+        #Initialize coordinator
+        self.coordinator = Coordinator()
         
         #Initialize servers
         self.video_server = VideoServer()
         self.audio_server = AudioServer()
 
-        #Initialize clientd
+        #Initialize clients
         self.video_client = VideoClient()
         self.audio_client = AudioClient()
 
@@ -496,12 +657,20 @@ class App:
 
         #Client needs to be able to change gui
         self.video_client.window = self.window
+
+        #Coordinator needs to contril clients and servers
+        self.coordinator.video_client = self.video_client
+        self.coordinator.video_server = self.video_server
+        self.coordinator.audio_client = self.audio_client
+        self.coordinator.audio_server = self.audio_server
+        self.coordinator.window = self.window
         
         #Window needs to control client and servers
         self.window.video_client = self.video_client
         self.window.audio_client = self.audio_client
         self.window.video_server = self.video_server
         self.window.audio_server = self.audio_server
+        self.window.coordinator = self.coordinator
         self.window.camera = self.webcam
 
         #The servers need to block incoming calls if already in a call
@@ -509,13 +678,13 @@ class App:
         self.audio_server.audio_client = self.audio_client
 
     def start(self):
-
+        
+        self.coordinator.start_server()
         self.webcam.start_camera()
-        self.window.start_window()
-
         #Start and wait for connections
         self.video_server.start_server()
         self.audio_server.start_server()
+        self.window.start_window()
 
         while self.webcam.running:
             
